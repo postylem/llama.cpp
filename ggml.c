@@ -10667,7 +10667,7 @@ static void ggml_compute_forward_custom_mask_f32(
         return;
     }
 
-    const int n  = ggml_nrows;
+    const int n  = ggml_nrows(src0);
     const int nc = src0->ne[0];
     const int nr = src0->ne[1];
     const int nz = n/nr;
@@ -11575,8 +11575,8 @@ static void ggml_compute_forward_rope_custom_f16(
 
                     theta *= theta_scale;
 
-                    const ggml_fp16_t * const src = (float *)((char *) src0->data + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
-                          ggml_fp16_t * dst_data  = (float *)((char *)  dst->data + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+                    const ggml_fp16_t * const src = (ggml_fp16_t *)((char *) src0->data + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+                          ggml_fp16_t * dst_data  = (ggml_fp16_t *)((char *)  dst->data + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
 
                     const float x0 = GGML_FP16_TO_FP32(src[0]);
                     const float x1 = GGML_FP16_TO_FP32(src[1]);
