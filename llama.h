@@ -156,6 +156,15 @@ extern "C" {
                              int   n_past,
                              int   n_threads);
 
+    LLAMA_API int llama_eval_multi(
+            struct llama_context * ctx,
+               const llama_token * tokens,
+                       const int * token_indices, // for rotary embeddings
+                     const float * attn_mask, // [N + n_past, N] of 0 or -inf
+                             int   n_tokens,
+                             int   n_past, // total number of tokens in kv-cache so far
+                             int   n_threads);
+
     // Convert the provided text into tokens.
     // The tokens pointer must be large enough to hold the resulting tokens.
     // Returns the number of tokens on success, no more than n_max_tokens

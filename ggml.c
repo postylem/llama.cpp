@@ -3474,9 +3474,11 @@ static const char * GGML_OP_LABEL[GGML_OP_COUNT] = {
     "DIAG",
     "DIAG_MASK_INF",
     "DIAG_MASK_ZERO",
+    "CUSTOM_MASK",
     "SOFT_MAX",
     "ROPE",
     "ROPE_BACK",
+    "ROPE_CUSTOM",
     "ALIBI",
     "CONV_1D_1S",
     "CONV_1D_2S",
@@ -3488,7 +3490,7 @@ static const char * GGML_OP_LABEL[GGML_OP_COUNT] = {
     "MAP_BINARY",
 };
 
-static_assert(GGML_OP_COUNT == 50, "GGML_OP_COUNT != 50");
+static_assert(GGML_OP_COUNT == 52, "GGML_OP_COUNT != 52");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -3534,9 +3536,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "diag(x)",
     "diag_mask_inf(x)",
     "diag_mask_zero(x)",
+    "custom_mask(x, y)",
     "soft_max(x)",
     "rope(x)",
     "rope_back(x)",
+    "rope_custom(x, y)",
     "alibi(x)",
     "conv_1d_1s(x)",
     "conv_1d_2s(x)",
@@ -3548,7 +3552,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "f(x,y)",
 };
 
-static_assert(GGML_OP_COUNT == 50, "GGML_OP_COUNT != 50");
+static_assert(GGML_OP_COUNT == 52, "GGML_OP_COUNT != 52");
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
@@ -6079,6 +6083,31 @@ struct ggml_tensor * ggml_diag_mask_zero_inplace(
     return ggml_diag_mask_zero_impl(ctx, a, n_past, true);
 }
 
+// ggml_custom_mask
+
+struct ggml_tensor * ggml_custom_mask( // TODO: maybe no longer necessary, with fixed `repeat`?
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    bool is_node = false;
+
+    if (a->grad) {
+        GGML_ASSERT(false); // TODO: implement backward
+        is_node = true;
+    }
+
+    // TODO: when implement backward, fix this
+    // struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    result->op = GGML_OP_CUSTOM_MASK;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src0 = a;
+    result->src1 = b;
+
+    return result;
+}
+
 // ggml_soft_max
 
 struct ggml_tensor * ggml_soft_max_impl(
@@ -6203,6 +6232,32 @@ struct ggml_tensor * ggml_rope_back(
 
     return result;
 }
+
+// ggml_rope_custom
+
+struct ggml_tensor * ggml_rope_custom(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    bool is_node = false;
+
+    if (a->grad) {
+        GGML_ASSERT(false); // TODO: implement backward
+        is_node = true;
+    }
+
+    // TODO: when implement backward, fix this:
+    //struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    result->op   = GGML_OP_ROPE_CUSTOM;
+    result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
+    result->src0 = a;
+    result->src1 = b;
+
+    return result;
+}
+
 
 // ggml_alibi
 
@@ -10599,6 +10654,54 @@ static void ggml_compute_forward_diag_mask_zero(
     }
 }
 
+// ggml_compute_forward_custom_mask
+
+static void ggml_compute_forward_custom_mask_f32(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+        struct ggml_tensor * dst) {
+    assert(params->ith == 0); // TODO: support multithreading
+
+    if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    const int n  = ggml_nrows;
+    const int nc = src0->ne[0];
+    const int nr = src0->ne[1];
+    const int nz = n/nr;
+
+    assert( dst->nb[0] == sizeof(float));
+    assert(src0->nb[0] == sizeof(float));
+
+    for (int k = 0; k < nz; k++) {
+        for (int j = 0; j < nr; j++) {
+            for (int i = 0; i < nc; i++) {
+                const float this_mask = *(float *) ((char *) src1->data + j*src1->nb[1] + i*src1->nb[0]);
+                *(float *) ((char *) dst->data + k*dst->nb[2] + j*dst->nb[1] + i*dst->nb[0]) += this_mask;
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_custom_mask(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+        struct ggml_tensor * dst) {
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_custom_mask_f32(params, src0, src1, dst);
+            } break;
+        default:
+            {
+                GGML_ASSERT(false);
+            } break;
+    }
+}
+
 // ggml_compute_forward_soft_max
 
 static void ggml_compute_forward_soft_max_f32(
@@ -11336,6 +11439,169 @@ static void ggml_compute_forward_rope_back(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_rope_back_f32(params, src0, src1, dst);
+            } break;
+        default:
+            {
+                GGML_ASSERT(false);
+            } break;
+    }
+}
+
+// ggml_compute_forward_rope_custom
+
+static void ggml_compute_forward_rope_custom_f32(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0, 
+        const struct ggml_tensor * src1,
+        struct ggml_tensor * dst) {
+    assert(src1->type == GGML_TYPE_I32);
+    assert(ggml_nelements(src1) == src0->ne[2]);
+
+    if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    const int32_t ne0 = (int32_t) (src0->ne[0]);
+    const int64_t ne1 = src0->ne[1];
+    const int64_t ne2 = src0->ne[2];
+    const int64_t ne3 = src0->ne[3];
+
+    const int nb0 = src0->nb[0];
+    const int nb1 = src0->nb[1];
+    const int nb2 = src0->nb[2];
+    const int nb3 = src0->nb[3];
+
+    assert(nb0 == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nr = ggml_nrows(src0); // n_head * N -- each row is some token and some head
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    // row index used to determine which thread to use
+    int ir = 0;
+
+    const float theta_scale = powf(10000.0, -2.0f/ne0);
+
+    for (int64_t i3 = 0; i3 < ne3; i3++) {
+        for (int64_t i2 = 0; i2 < ne2; i2++) { // for each token
+            const int p = ((int32_t *) src1->data)[i2];
+            for (int64_t i1 = 0; i1 < ne1; i1++) { // for each head
+                if (ir++ < ir0) continue; // skip rows until first for this thread
+                if (ir   > ir1) break; // stop when last row for this thread
+
+                float theta = (float)p;
+
+                for (int i0 = 0; i0 < ne0; i0 += 2) {
+                    const float cos_theta = cosf(theta);
+                    const float sin_theta = sinf(theta);
+
+                    theta *= theta_scale;
+
+                    const float * const src = (float *)((char *) src0->data + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+                          float * dst_data  = (float *)((char *)  dst->data + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+
+                    const float x0 = src[0];
+                    const float x1 = src[1];
+
+                    dst_data[0] = x0*cos_theta - x1*sin_theta;
+                    dst_data[1] = x0*sin_theta + x1*cos_theta;
+              }
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_rope_custom_f16(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0, 
+        const struct ggml_tensor * src1,
+        struct ggml_tensor * dst) {
+    assert(src1->type == GGML_TYPE_I32);
+    assert(ggml_nelements(src1) == src0->ne[2]);
+
+    if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    const int32_t ne0 = (int32_t) (src0->ne[0]);
+    const int64_t ne1 = src0->ne[1];
+    const int64_t ne2 = src0->ne[2];
+    const int64_t ne3 = src0->ne[3];
+
+    const int nb0 = src0->nb[0];
+    const int nb1 = src0->nb[1];
+    const int nb2 = src0->nb[2];
+    const int nb3 = src0->nb[3];
+
+    assert(nb0 == sizeof(ggml_fp16_t));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nr = ggml_nrows(src0); // n_head * N -- each row is some token and some head
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    // row index used to determine which thread to use
+    int ir = 0;
+
+    const float theta_scale = powf(10000.0, -2.0f/ne0);
+
+    for (int64_t i3 = 0; i3 < ne3; i3++) {
+        for (int64_t i2 = 0; i2 < ne2; i2++) { // for each token
+            const int p = ((int32_t *) src1->data)[i2];
+            for (int64_t i1 = 0; i1 < ne1; i1++) { // for each head
+                if (ir++ < ir0) continue; // skip rows until first for this thread
+                if (ir   > ir1) break; // stop when last row for this thread
+
+                float theta = (float)p;
+
+                for (int i0 = 0; i0 < ne0; i0 += 2) {
+                    const float cos_theta = cosf(theta);
+                    const float sin_theta = sinf(theta);
+
+                    theta *= theta_scale;
+
+                    const ggml_fp16_t * const src = (float *)((char *) src0->data + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+                          ggml_fp16_t * dst_data  = (float *)((char *)  dst->data + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+
+                    const float x0 = GGML_FP16_TO_FP32(src[0]);
+                    const float x1 = GGML_FP16_TO_FP32(src[1]);
+
+                    dst_data[0] = GGML_FP32_TO_FP16(x0*cos_theta - x1*sin_theta);
+                    dst_data[1] = GGML_FP32_TO_FP16(x0*sin_theta + x1*cos_theta);
+              }
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_rope_custom(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+        struct ggml_tensor * dst) {
+    switch (src0->type) {
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_rope_custom_f16(params, src0, src1, dst);
+            } break;
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_rope_custom_f32(params, src0, src1, dst);
             } break;
         default:
             {
@@ -12811,6 +13077,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_diag_mask_zero(params, tensor->src0, tensor->src1, tensor);
             } break;
+        case GGML_OP_CUSTOM_MASK:
+            {
+                ggml_compute_forward_custom_mask(params, tensor->src0, tensor->src1, tensor);
+            } break;
         case GGML_OP_SOFT_MAX:
             {
                 ggml_compute_forward_soft_max(params, tensor->src0, tensor);
@@ -12822,6 +13092,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_ROPE_BACK:
             {
                 ggml_compute_forward_rope_back(params, tensor->src0, tensor->src1, tensor);
+            } break;
+        case GGML_OP_ROPE_CUSTOM:
+            {
+                ggml_compute_forward_rope_custom(params, tensor->src0, tensor->src1, tensor);
             } break;
         case GGML_OP_ALIBI:
             {
@@ -13428,6 +13702,10 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
                     // noop
                 }
             } break;
+        case GGML_OP_CUSTOM_MASK:
+            {
+                GGML_ASSERT(false); // TODO: not implemented
+            } break;
         case GGML_OP_SOFT_MAX:
             {
                 // necessary for llama
@@ -13519,6 +13797,10 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
                 if (src1->grad) {
                     // noop
                 }
+            } break;
+        case GGML_OP_ROPE_CUSTOM:
+            {
+                GGML_ASSERT(false); // TODO: not implemented
             } break;
         case GGML_OP_CONV_1D_1S:
             {
@@ -14003,9 +14285,17 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                         node->n_tasks = 1;
                     } break;
                 case GGML_OP_DIAG_MASK_INF:
+                    {
+                        node->n_tasks = n_threads;
+                    } break;
+                case GGML_OP_CUSTOM_MASK:
+                    {
+                        node->n_tasks = 1; // TODO: support multithreading
+                    } break;
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:
                 case GGML_OP_ROPE_BACK:
+                case GGML_OP_ROPE_CUSTOM:
                     {
                         node->n_tasks = n_threads;
                     } break;
