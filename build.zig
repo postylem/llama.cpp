@@ -1,61 +1,87 @@
+// Compatible with Zig Version 0.11.0
 const std = @import("std");
+const Compile = std.Build.Step.Compile;
+const ConfigHeader = std.Build.Step.ConfigHeader;
+const Mode = std.builtin.Mode;
+const CrossTarget = std.zig.CrossTarget;
 
-pub fn build(b: *std.build.Builder) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardReleaseOptions();
-    const want_lto = b.option(bool, "lto", "Want -fLTO");
+const Maker = struct {
+    builder: *std.build.Builder,
+    target: CrossTarget,
+    optimize: Mode,
+    config_header: *ConfigHeader,
 
-    const lib = b.addStaticLibrary("llama", null);
-    lib.want_lto = want_lto;
-    lib.setTarget(target);
-    lib.setBuildMode(optimize);
-    lib.linkLibCpp();
-    lib.addIncludePath(".");
-    lib.addIncludePath("examples");
-    lib.addCSourceFiles(&.{
-        "ggml.c",
-    }, &.{"-std=c11"});
-    lib.addCSourceFiles(&.{
-        "llama.cpp",
-    }, &.{"-std=c++11"});
-    lib.install();
+    const cflags = .{"-std=c11"};
+    const cxxflags = .{"-std=c++11"};
 
-    const build_args = .{ .b = b, .lib = lib, .target = target, .optimize = optimize, .want_lto = want_lto };
-
-    const exe = build_example("main", build_args);
-    _ = build_example("quantize", build_args);
-    _ = build_example("perplexity", build_args);
-    _ = build_example("embedding", build_args);
-
-    // create "zig build run" command for ./main
-
-    const run_cmd = exe.run();
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+    fn init(builder: *std.build.Builder) Maker {
+        const commit_hash = @embedFile(".git/refs/heads/master");
+        const config_header = builder.addConfigHeader(
+            .{ .style = .blank, .include_path = "build-info.h" },
+            .{
+                .BUILD_NUMBER = 0,
+                .BUILD_COMMIT = commit_hash[0 .. commit_hash.len - 1], // omit newline
+            },
+        );
+        return Maker{
+            .builder = builder,
+            .target = builder.standardTargetOptions(.{}),
+            .optimize = builder.standardOptimizeOption(.{}),
+            .config_header = config_header,
+        };
     }
 
-    const run_step = b.step("run", "Run the app");
-    run_step.dependOn(&run_cmd.step);
-}
+    fn obj(m: *const Maker, name: []const u8, src: []const u8) *Compile {
+        const o = m.builder.addObject(.{ .name = name, .target = m.target, .optimize = m.optimize });
+        if (std.mem.endsWith(u8, src, ".c")) {
+            o.addCSourceFiles(&.{src}, &cflags);
+            o.linkLibC();
+        } else {
+            o.addCSourceFiles(&.{src}, &cxxflags);
+            o.linkLibCpp();
+        }
+        o.addIncludePath(.{ .path = "." });
+        o.addIncludePath(.{ .path = "./examples" });
+        return o;
+    }
 
-fn build_example(comptime name: []const u8, args: anytype) *std.build.LibExeObjStep {
-    const b = args.b;
-    const lib = args.lib;
-    const want_lto = args.want_lto;
+    fn exe(m: *const Maker, name: []const u8, src: []const u8, deps: []const *Compile) *Compile {
+        const e = m.builder.addExecutable(.{ .name = name, .target = m.target, .optimize = m.optimize });
+        e.addIncludePath(.{ .path = "." });
+        e.addIncludePath(.{ .path = "./examples" });
+        e.addCSourceFiles(&.{src}, &cxxflags);
+        for (deps) |d| e.addObject(d);
+        e.linkLibC();
+        e.linkLibCpp();
+        e.addConfigHeader(m.config_header);
+        m.builder.installArtifact(e);
 
-    const exe = b.addExecutable(name, null);
-    exe.want_lto = want_lto;
-    lib.setTarget(args.target);
-    lib.setBuildMode(args.optimize);
-    exe.addIncludePath(".");
-    exe.addIncludePath("examples");
-    exe.addCSourceFiles(&.{
-        std.fmt.comptimePrint("examples/{s}/{s}.cpp", .{name, name}),
-        "examples/common.cpp",
-    }, &.{"-std=c++11"});
-    exe.linkLibrary(lib);
-    exe.install();
+        // Currently a bug is preventing correct linking for optimized builds for Windows:
+        // https://github.com/ziglang/zig/issues/15958
+        if (e.target.isWindows()) {
+            e.want_lto = false;
+        }
+        return e;
+    }
+};
 
-    return exe;
+pub fn build(b: *std.build.Builder) void {
+    const make = Maker.init(b);
+
+    const ggml = make.obj("ggml", "ggml.c");
+    const ggml_alloc = make.obj("ggml-alloc", "ggml-alloc.c");
+    const llama = make.obj("llama", "llama.cpp");
+    const common = make.obj("common", "examples/common.cpp");
+    const grammar_parser = make.obj("grammar-parser", "examples/grammar-parser.cpp");
+
+    _ = make.exe("main", "examples/main/main.cpp", &.{ ggml, ggml_alloc, llama, common, grammar_parser });
+    _ = make.exe("quantize", "examples/quantize/quantize.cpp", &.{ ggml, ggml_alloc, llama });
+    _ = make.exe("perplexity", "examples/perplexity/perplexity.cpp", &.{ ggml, ggml_alloc, llama, common });
+    _ = make.exe("embedding", "examples/embedding/embedding.cpp", &.{ ggml, ggml_alloc, llama, common });
+    _ = make.exe("train-text-from-scratch", "examples/train-text-from-scratch/train-text-from-scratch.cpp", &.{ ggml, ggml_alloc, llama });
+
+    const server = make.exe("server", "examples/server/server.cpp", &.{ ggml, ggml_alloc, llama, common, grammar_parser });
+    if (server.target.isWindows()) {
+        server.linkSystemLibrary("ws2_32");
+    }
 }
